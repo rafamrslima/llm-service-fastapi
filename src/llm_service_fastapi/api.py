@@ -1,5 +1,6 @@
 from enum import Enum
 
+import ollama
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from google import genai
@@ -33,7 +34,8 @@ class AnalysisRequest(BaseModel):
 
 load_dotenv()
 app = FastAPI()
-client = genai.Client()
+geminiClient = genai.Client()
+ollamaClient = ollama.AsyncClient()
 
 
 @app.get("/")
@@ -53,7 +55,7 @@ async def update_item(item_id: int, item: Item):
 
 async def call_gemini(prompt: str) -> TextAnalyzes:
     try:
-        response = await client.aio.models.generate_content(
+        response = await geminiClient.aio.models.generate_content(
             model="gemini-3.6-flash",
             contents=prompt,
             config=types.GenerateContentConfig(
@@ -67,6 +69,24 @@ async def call_gemini(prompt: str) -> TextAnalyzes:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/analyze", response_model=TextAnalyzes)
-async def analyze_endpoint(payload: AnalysisRequest):
+async def call_ollama(prompt: str) -> TextAnalyzes:
+    try:
+        response = await ollamaClient.generate(
+            model="gemma3:270m",
+            prompt=prompt,
+            format=TextAnalyzes.model_json_schema(),
+            options={"temperature": 0.1},
+        )
+        return TextAnalyzes.model_validate_json(response.response)
+    except Exception as e:  # noqa: BLE001 - Ollama errors and schema mismatches both surface as 500
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/analyze/gemini", response_model=TextAnalyzes)
+async def analyze_endpoint_gemini(payload: AnalysisRequest):
     return await call_gemini(payload.text)
+
+
+@app.post("/analyze/ollama", response_model=TextAnalyzes)
+async def analyze_endpoint_ollama(payload: AnalysisRequest):
+    return await call_ollama(payload.text)
