@@ -126,23 +126,15 @@ async def call_gemini(prompt: str) -> TextAnalyzes:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-async def call_anthropic(prompt: str) -> str:
+async def call_anthropic(prompt: str) -> TextAnalyzes:
     try:
-        message = await anthropicClient.messages.create(
-            max_tokens=1024,
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt,
-                }
-            ],
+        response = await anthropicClient.messages.parse(
             model="claude-opus-5",
+            max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}],
+            output_format=TextAnalyzes,
         )
-        for block in message.content:
-            if block.type == "text":
-                print(block.text)
-                return block.text
-
+        return response.parsed_output
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -250,7 +242,7 @@ async def analyze_endpoint_gemini(payload: AnalysisRequest):
     return await call_gemini(payload.text)
 
 
-@app.post("/analyze/anthropic")
+@app.post("/analyze/anthropic", response_model=TextAnalyzes)
 async def analyze_endpoint_anthropic(payload: AnalysisRequest):
     return await call_anthropic(payload.text)
 
