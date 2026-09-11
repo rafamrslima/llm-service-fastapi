@@ -1,3 +1,4 @@
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 
 import ollama
@@ -6,6 +7,7 @@ from fastapi import FastAPI, HTTPException
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
+from anthropic import AsyncAnthropic
 
 
 class Item(BaseModel):
@@ -32,10 +34,65 @@ class AnalysisRequest(BaseModel):
     text: str
 
 
+class ChatRequest(BaseModel):
+    prompt: str
+
+
+class ChatResponse(BaseModel):
+    answer: str
+
+
+class Timezones(str, Enum):
+    BRAZIL = "BR"
+    EUROPE = "EU"
+    ASIA = "ASIA"
+
+
+def get_current_time(tz: Timezones):
+    time_now = datetime.now(UTC)
+    if tz == Timezones.BRAZIL:
+        time_now = time_now - timedelta(hours=5)
+    elif tz == Timezones.ASIA:
+        time_now = time_now + timedelta(hours=5)
+    elif tz != Timezones.EUROPE:
+        print("timezone not accepted.")
+
+    print(time_now)
+    return time_now
+
+
+class GetCurrentTimeParams(BaseModel):
+    tz: Timezones = Field(
+        description="Timezone region to compute the current time for."
+    )
+
+
+get_current_time_declaration = types.FunctionDeclaration(
+    name="get_current_time",
+    description=(
+        "Returns the current date and time adjusted for a given timezone region "
+        "(Brazil, Europe, or Asia)."
+    ),
+    parameters_json_schema=GetCurrentTimeParams.model_json_schema(),
+)
+
+time_tool = types.Tool(function_declarations=[get_current_time_declaration])
+
+anthropic_time_tool = {
+    "name": "get_current_time",
+    "description": (
+        "Returns the current date and time adjusted for a given timezone region "
+        "(Brazil, Europe, or Asia)."
+    ),
+    "input_schema": GetCurrentTimeParams.model_json_schema(),
+}
+
+
 load_dotenv()
 app = FastAPI()
 geminiClient = genai.Client()
 ollamaClient = ollama.AsyncClient()
+anthropicClient = AsyncAnthropic()
 
 
 @app.get("/")
@@ -69,6 +126,27 @@ async def call_gemini(prompt: str) -> TextAnalyzes:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+async def call_anthropic(prompt: str) -> str:
+    try:
+        message = await anthropicClient.messages.create(
+            max_tokens=1024,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt,
+                }
+            ],
+            model="claude-opus-5",
+        )
+        for block in message.content:
+            if block.type == "text":
+                print(block.text)
+                return block.text
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 async def call_ollama(prompt: str) -> TextAnalyzes:
     try:
         response = await ollamaClient.generate(
@@ -82,11 +160,116 @@ async def call_ollama(prompt: str) -> TextAnalyzes:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+async def call_gemini_with_tools(prompt: str) -> str:
+    try:
+        contents = [types.Content(role="user", parts=[types.Part(text=prompt)])]
+        response = await geminiClient.aio.models.generate_content(
+            model="gemini-3.6-flash",
+            contents=contents,
+            config=types.GenerateContentConfig(tools=[time_tool]),
+        )
+
+        function_calls = response.function_calls
+        if not function_calls:
+            return response.text
+
+        call = function_calls[0]
+        print(f"[tool call] {call.name}(tz={call.args.get('tz')})")
+        params = GetCurrentTimeParams.model_validate(call.args)
+        result = get_current_time(params.tz)
+
+        contents.append(response.candidates[0].content)
+        contents.append(
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part.from_function_response(
+                        name=call.name,
+                        response={"current_time": result.isoformat()},
+                    )
+                ],
+            )
+        )
+
+        follow_up = await geminiClient.aio.models.generate_content(
+            model="gemini-3.6-flash",
+            contents=contents,
+            config=types.GenerateContentConfig(tools=[time_tool]),
+        )
+        return follow_up.text
+    except Exception as e:  # noqa: BLE001 - Gemini errors and tool-call handling both surface as 500
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def call_anthropic_with_tools(prompt: str) -> str:
+    try:
+        messages = [{"role": "user", "content": prompt}]
+        response = await anthropicClient.messages.create(
+            model="claude-opus-5",
+            max_tokens=1024,
+            messages=messages,
+            tools=[anthropic_time_tool],
+        )
+
+        tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
+        if not tool_use_blocks:
+            return next((b.text for b in response.content if b.type == "text"), "")
+
+        call = tool_use_blocks[0]
+        print(f"[tool call] {call.name}(tz={call.input.get('tz')})")
+        params = GetCurrentTimeParams.model_validate(call.input)
+        result = get_current_time(params.tz)
+
+        messages.append({"role": "assistant", "content": response.content})
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": call.id,
+                        "content": result.isoformat(),
+                    }
+                ],
+            }
+        )
+
+        follow_up = await anthropicClient.messages.create(
+            model="claude-opus-5",
+            max_tokens=1024,
+            messages=messages,
+            tools=[anthropic_time_tool],
+        )
+        return next((b.text for b in follow_up.content if b.type == "text"), "")
+    except Exception as e:  # noqa: BLE001 - Anthropic errors and tool-call handling both surface as 500
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/analyze/gemini", response_model=TextAnalyzes)
 async def analyze_endpoint_gemini(payload: AnalysisRequest):
     return await call_gemini(payload.text)
 
 
+@app.post("/analyze/anthropic")
+async def analyze_endpoint_anthropic(payload: AnalysisRequest):
+    return await call_anthropic(payload.text)
+
+
 @app.post("/analyze/ollama", response_model=TextAnalyzes)
 async def analyze_endpoint_ollama(payload: AnalysisRequest):
     return await call_ollama(payload.text)
+
+
+@app.post("/ask/gemini", response_model=ChatResponse)
+async def ask_gemini_endpoint(payload: ChatRequest):
+    answer = await call_gemini_with_tools(payload.prompt)
+    return ChatResponse(answer=answer)
+
+
+@app.post("/ask/anthropic", response_model=ChatResponse)
+async def ask_anthropic_endpoint(payload: ChatRequest):
+    answer = await call_anthropic_with_tools(payload.prompt)
+    return ChatResponse(answer=answer)
+
+
+get_current_time(Timezones.EUROPE)
