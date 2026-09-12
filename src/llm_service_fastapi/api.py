@@ -1,13 +1,14 @@
-from datetime import UTC, datetime, timedelta
+from datetime import datetime
 from enum import Enum
+from zoneinfo import ZoneInfo
 
 import ollama
+from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
-from anthropic import AsyncAnthropic
 
 
 class Item(BaseModel):
@@ -43,35 +44,28 @@ class ChatResponse(BaseModel):
 
 
 class Timezones(str, Enum):
-    BRAZIL = "BR"
-    EUROPE = "EU"
-    ASIA = "ASIA"
+    SAO_PAULO = "America/Sao_Paulo"
+    LONDON = "Europe/London"
+    TOKYO = "Asia/Tokyo"
 
 
 def get_current_time(tz: Timezones):
-    time_now = datetime.now(UTC)
-    if tz == Timezones.BRAZIL:
-        time_now = time_now - timedelta(hours=5)
-    elif tz == Timezones.ASIA:
-        time_now = time_now + timedelta(hours=5)
-    elif tz != Timezones.EUROPE:
-        print("timezone not accepted.")
-
+    time_now = datetime.now(ZoneInfo(tz.value))
     print(time_now)
     return time_now
 
 
 class GetCurrentTimeParams(BaseModel):
     tz: Timezones = Field(
-        description="Timezone region to compute the current time for."
+        description="IANA timezone name to compute the current local time for."
     )
 
 
 get_current_time_declaration = types.FunctionDeclaration(
     name="get_current_time",
     description=(
-        "Returns the current date and time adjusted for a given timezone region "
-        "(Brazil, Europe, or Asia)."
+        "Returns the current local date and time for a given IANA timezone "
+        "(America/Sao_Paulo, Europe/London, or Asia/Tokyo)."
     ),
     parameters_json_schema=GetCurrentTimeParams.model_json_schema(),
 )
@@ -81,8 +75,8 @@ time_tool = types.Tool(function_declarations=[get_current_time_declaration])
 anthropic_time_tool = {
     "name": "get_current_time",
     "description": (
-        "Returns the current date and time adjusted for a given timezone region "
-        "(Brazil, Europe, or Asia)."
+        "Returns the current local date and time for a given IANA timezone "
+        "(America/Sao_Paulo, Europe/London, or Asia/Tokyo)."
     ),
     "input_schema": GetCurrentTimeParams.model_json_schema(),
 }
@@ -135,7 +129,7 @@ async def call_anthropic(prompt: str) -> TextAnalyzes:
             output_format=TextAnalyzes,
         )
         return response.parsed_output
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - Anthropic errors and schema mismatches both surface as 500
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -203,6 +197,7 @@ async def call_anthropic_with_tools(prompt: str) -> str:
             tools=[anthropic_time_tool],
         )
 
+        print(response.usage)
         tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
         if not tool_use_blocks:
             return next((b.text for b in response.content if b.type == "text"), "")
@@ -262,6 +257,3 @@ async def ask_gemini_endpoint(payload: ChatRequest):
 async def ask_anthropic_endpoint(payload: ChatRequest):
     answer = await call_anthropic_with_tools(payload.prompt)
     return ChatResponse(answer=answer)
-
-
-get_current_time(Timezones.EUROPE)
