@@ -1,3 +1,4 @@
+import json
 from datetime import datetime
 from enum import Enum
 from zoneinfo import ZoneInfo
@@ -49,10 +50,29 @@ class Timezones(str, Enum):
     TOKYO = "Asia/Tokyo"
 
 
+BUSINESS_HOURS_START = 9
+BUSINESS_HOURS_END = 17
+
+
 def get_current_time(tz: Timezones):
     time_now = datetime.now(ZoneInfo(tz.value))
     print(time_now)
     return time_now
+
+
+def convert_time(time: str, from_tz: Timezones, to_tz: Timezones):
+    source_zone = ZoneInfo(from_tz.value)
+    # Anchored to today's date in the source zone so the conversion respects DST.
+    today = datetime.now(source_zone).date()
+    parsed = datetime.strptime(time, "%H:%M").time()  # noqa: DTZ007 - only the time part is kept; tzinfo is attached below
+    source = datetime.combine(today, parsed, tzinfo=source_zone)
+    return source.astimezone(ZoneInfo(to_tz.value))
+
+
+def is_business_hours(tz: Timezones):
+    now = datetime.now(ZoneInfo(tz.value))
+    is_weekday = now.weekday() < 5
+    return is_weekday and BUSINESS_HOURS_START <= now.hour < BUSINESS_HOURS_END
 
 
 class GetCurrentTimeParams(BaseModel):
@@ -61,25 +81,72 @@ class GetCurrentTimeParams(BaseModel):
     )
 
 
-get_current_time_declaration = types.FunctionDeclaration(
-    name="get_current_time",
-    description=(
-        "Returns the current local date and time for a given IANA timezone "
-        "(America/Sao_Paulo, Europe/London, or Asia/Tokyo)."
+class ConvertTimeParams(BaseModel):
+    time: str = Field(description="Time to convert, in 24-hour HH:MM format.")
+    from_tz: Timezones = Field(description="IANA timezone the time is given in.")
+    to_tz: Timezones = Field(description="IANA timezone to convert the time into.")
+
+
+class IsBusinessHoursParams(BaseModel):
+    tz: Timezones = Field(description="IANA timezone to check business hours in.")
+
+
+TOOL_SPECS = {
+    "get_current_time": (
+        "Returns the current local date and time for a given IANA timezone.",
+        GetCurrentTimeParams,
+        get_current_time,
     ),
-    parameters_json_schema=GetCurrentTimeParams.model_json_schema(),
+    "convert_time": (
+        (
+            "Converts a time from one IANA timezone to another, using today's "
+            "date in the source timezone."
+        ),
+        ConvertTimeParams,
+        convert_time,
+    ),
+    "is_business_hours": (
+        (
+            f"Returns whether it is currently business hours "
+            f"({BUSINESS_HOURS_START:02d}:00-{BUSINESS_HOURS_END:02d}:00, "
+            f"Monday to Friday) in a given IANA timezone."
+        ),
+        IsBusinessHoursParams,
+        is_business_hours,
+    ),
+}
+
+time_tool = types.Tool(
+    function_declarations=[
+        types.FunctionDeclaration(
+            name=name,
+            description=description,
+            parameters_json_schema=params_model.model_json_schema(),
+        )
+        for name, (description, params_model, _) in TOOL_SPECS.items()
+    ]
 )
 
-time_tool = types.Tool(function_declarations=[get_current_time_declaration])
+anthropic_time_tools = [
+    {
+        "name": name,
+        "description": description,
+        "input_schema": params_model.model_json_schema(),
+    }
+    for name, (description, params_model, _) in TOOL_SPECS.items()
+]
 
-anthropic_time_tool = {
-    "name": "get_current_time",
-    "description": (
-        "Returns the current local date and time for a given IANA timezone "
-        "(America/Sao_Paulo, Europe/London, or Asia/Tokyo)."
-    ),
-    "input_schema": GetCurrentTimeParams.model_json_schema(),
-}
+
+# Caps how many times a model may chain tool calls before we stop asking it.
+MAX_TOOL_ROUNDS = 5
+
+
+def run_tool(name: str, args: dict):
+    _, params_model, fn = TOOL_SPECS[name]
+    params = params_model.model_validate(args)
+    result = fn(**params.model_dump())
+    print(f"[tool call] {name}({params.model_dump_json()}) -> {result}")
+    return result.isoformat() if isinstance(result, datetime) else result
 
 
 load_dotenv()
@@ -149,40 +216,38 @@ async def call_ollama(prompt: str) -> TextAnalyzes:
 async def call_gemini_with_tools(prompt: str) -> str:
     try:
         contents = [types.Content(role="user", parts=[types.Part(text=prompt)])]
-        response = await geminiClient.aio.models.generate_content(
-            model="gemini-3.6-flash",
-            contents=contents,
-            config=types.GenerateContentConfig(tools=[time_tool]),
-        )
 
-        function_calls = response.function_calls
-        if not function_calls:
-            return response.text
-
-        call = function_calls[0]
-        print(f"[tool call] {call.name}(tz={call.args.get('tz')})")
-        params = GetCurrentTimeParams.model_validate(call.args)
-        result = get_current_time(params.tz)
-
-        contents.append(response.candidates[0].content)
-        contents.append(
-            types.Content(
-                role="user",
-                parts=[
-                    types.Part.from_function_response(
-                        name=call.name,
-                        response={"current_time": result.isoformat()},
-                    )
-                ],
+        for _ in range(MAX_TOOL_ROUNDS):
+            response = await geminiClient.aio.models.generate_content(
+                model="gemini-3.6-flash",
+                contents=contents,
+                config=types.GenerateContentConfig(tools=[time_tool]),
             )
-        )
 
-        follow_up = await geminiClient.aio.models.generate_content(
-            model="gemini-3.6-flash",
-            contents=contents,
-            config=types.GenerateContentConfig(tools=[time_tool]),
+            function_calls = response.function_calls
+            if not function_calls:
+                return response.text
+
+            contents.append(response.candidates[0].content)
+            contents.append(
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part.from_function_response(
+                            name=call.name,
+                            response={"result": run_tool(call.name, call.args)},
+                        )
+                        for call in function_calls
+                    ],
+                )
+            )
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Gemini still requested tools after {MAX_TOOL_ROUNDS} rounds.",
         )
-        return follow_up.text
+    except HTTPException:
+        raise
     except Exception as e:  # noqa: BLE001 - Gemini errors and tool-call handling both surface as 500
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -190,44 +255,41 @@ async def call_gemini_with_tools(prompt: str) -> str:
 async def call_anthropic_with_tools(prompt: str) -> str:
     try:
         messages = [{"role": "user", "content": prompt}]
-        response = await anthropicClient.messages.create(
-            model="claude-opus-5",
-            max_tokens=1024,
-            messages=messages,
-            tools=[anthropic_time_tool],
+
+        for _ in range(MAX_TOOL_ROUNDS):
+            response = await anthropicClient.messages.create(
+                model="claude-opus-5",
+                max_tokens=1024,
+                messages=messages,
+                tools=anthropic_time_tools,
+            )
+
+            print(response.usage)
+            tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
+            if not tool_use_blocks:
+                return next((b.text for b in response.content if b.type == "text"), "")
+
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": call.id,
+                            "content": json.dumps(run_tool(call.name, call.input)),
+                        }
+                        for call in tool_use_blocks
+                    ],
+                }
+            )
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Claude still requested tools after {MAX_TOOL_ROUNDS} rounds.",
         )
-
-        print(response.usage)
-        tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
-        if not tool_use_blocks:
-            return next((b.text for b in response.content if b.type == "text"), "")
-
-        call = tool_use_blocks[0]
-        print(f"[tool call] {call.name}(tz={call.input.get('tz')})")
-        params = GetCurrentTimeParams.model_validate(call.input)
-        result = get_current_time(params.tz)
-
-        messages.append({"role": "assistant", "content": response.content})
-        messages.append(
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": call.id,
-                        "content": result.isoformat(),
-                    }
-                ],
-            }
-        )
-
-        follow_up = await anthropicClient.messages.create(
-            model="claude-opus-5",
-            max_tokens=1024,
-            messages=messages,
-            tools=[anthropic_time_tool],
-        )
-        return next((b.text for b in follow_up.content if b.type == "text"), "")
+    except HTTPException:
+        raise
     except Exception as e:  # noqa: BLE001 - Anthropic errors and tool-call handling both surface as 500
         raise HTTPException(status_code=500, detail=str(e))
 
