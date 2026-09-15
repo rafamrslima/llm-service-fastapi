@@ -136,9 +136,14 @@ Response (`200`):
 }
 ```
 
+If the model calls a tool that doesn't exist, or passes arguments that fail validation,
+the error is sent back to it as the tool result instead of failing the request. Models
+usually correct the call on the next round.
+
 Each request allows at most 5 tool-call rounds. If the model is still calling tools after
-that, the endpoint returns a `500` instead of a partial answer. `/ask/anthropic` also
-requires `ANTHROPIC_API_KEY` in `.env`.
+that, it's told to answer with the results it already has, tool calls are disabled for
+that last request, and the endpoint returns that partial answer. A warning is logged when
+this happens. `/ask/anthropic` also requires `ANTHROPIC_API_KEY` in `.env`.
 
 ## Tools
 

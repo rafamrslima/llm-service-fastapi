@@ -1,4 +1,5 @@
 import json
+import logging
 from datetime import datetime
 from enum import Enum
 from zoneinfo import ZoneInfo
@@ -9,7 +10,9 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from google import genai
 from google.genai import types
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
+
+logger = logging.getLogger(__name__)
 
 
 class Item(BaseModel):
@@ -82,7 +85,10 @@ class GetCurrentTimeParams(BaseModel):
 
 
 class ConvertTimeParams(BaseModel):
-    time: str = Field(description="Time to convert, in 24-hour HH:MM format.")
+    time: str = Field(
+        description="Time to convert, in 24-hour HH:MM format.",
+        pattern=r"^([01]\d|2[0-3]):[0-5]\d$",
+    )
     from_tz: Timezones = Field(description="IANA timezone the time is given in.")
     to_tz: Timezones = Field(description="IANA timezone to convert the time into.")
 
@@ -137,16 +143,32 @@ anthropic_time_tools = [
 ]
 
 
-# Caps how many times a model may chain tool calls before we stop asking it.
+# Caps how many times a model may chain tool calls before we ask it to wrap up.
 MAX_TOOL_ROUNDS = 5
 
+STEP_LIMIT_INSTRUCTION = (
+    "You've reached the tool-call limit for this request and can't call any more "
+    "tools. Answer now using the results you already have, and briefly say what you "
+    "weren't able to complete."
+)
 
-def run_tool(name: str, args: dict):
+
+def run_tool(name: str, args: dict | None) -> tuple[object, bool]:
+    # Errors are returned instead of raised so the model sees them and can retry.
+    if name not in TOOL_SPECS:
+        print(f"[tool call] unknown tool {name!r}")
+        return f"Unknown tool '{name}'. Available tools: {', '.join(TOOL_SPECS)}.", True
+
     _, params_model, fn = TOOL_SPECS[name]
-    params = params_model.model_validate(args)
+    try:
+        params = params_model.model_validate(args or {})
+    except ValidationError as e:
+        print(f"[tool call] {name} rejected invalid arguments: {args}")
+        return f"Invalid arguments for '{name}': {e.json(include_url=False)}", True
+
     result = fn(**params.model_dump())
     print(f"[tool call] {name}({params.model_dump_json()}) -> {result}")
-    return result.isoformat() if isinstance(result, datetime) else result
+    return (result.isoformat() if isinstance(result, datetime) else result), False
 
 
 load_dotenv()
@@ -228,26 +250,37 @@ async def call_gemini_with_tools(prompt: str) -> str:
             if not function_calls:
                 return response.text
 
-            contents.append(response.candidates[0].content)
-            contents.append(
-                types.Content(
-                    role="user",
-                    parts=[
-                        types.Part.from_function_response(
-                            name=call.name,
-                            response={"result": run_tool(call.name, call.args)},
-                        )
-                        for call in function_calls
-                    ],
+            parts = []
+            for call in function_calls:
+                content, is_error = run_tool(call.name, call.args)
+                parts.append(
+                    types.Part.from_function_response(
+                        name=call.name,
+                        response={"error" if is_error else "result": content},
+                    )
                 )
-            )
+            contents.append(response.candidates[0].content)
+            contents.append(types.Content(role="user", parts=parts))
 
-        raise HTTPException(
-            status_code=500,
-            detail=f"Gemini still requested tools after {MAX_TOOL_ROUNDS} rounds.",
+        logger.warning(
+            "Gemini wasn't able to complete that within the step limit "
+            "(%d tool rounds); returning a partial answer.",
+            MAX_TOOL_ROUNDS,
         )
-    except HTTPException:
-        raise
+        contents[-1].parts.append(types.Part(text=STEP_LIMIT_INSTRUCTION))
+        final = await geminiClient.aio.models.generate_content(
+            model="gemini-3.6-flash",
+            contents=contents,
+            config=types.GenerateContentConfig(
+                tools=[time_tool],
+                tool_config=types.ToolConfig(
+                    function_calling_config=types.FunctionCallingConfig(
+                        mode=types.FunctionCallingConfigMode.NONE
+                    )
+                ),
+            ),
+        )
+        return final.text
     except Exception as e:  # noqa: BLE001 - Gemini errors and tool-call handling both surface as 500
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -269,27 +302,34 @@ async def call_anthropic_with_tools(prompt: str) -> str:
             if not tool_use_blocks:
                 return next((b.text for b in response.content if b.type == "text"), "")
 
+            tool_results = []
+            for call in tool_use_blocks:
+                content, is_error = run_tool(call.name, call.input)
+                tool_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": call.id,
+                        "content": content if is_error else json.dumps(content),
+                        "is_error": is_error,
+                    }
+                )
             messages.append({"role": "assistant", "content": response.content})
-            messages.append(
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": call.id,
-                            "content": json.dumps(run_tool(call.name, call.input)),
-                        }
-                        for call in tool_use_blocks
-                    ],
-                }
-            )
+            messages.append({"role": "user", "content": tool_results})
 
-        raise HTTPException(
-            status_code=500,
-            detail=f"Claude still requested tools after {MAX_TOOL_ROUNDS} rounds.",
+        logger.warning(
+            "Claude wasn't able to complete that within the step limit "
+            "(%d tool rounds); returning a partial answer.",
+            MAX_TOOL_ROUNDS,
         )
-    except HTTPException:
-        raise
+        messages[-1]["content"].append({"type": "text", "text": STEP_LIMIT_INSTRUCTION})
+        final = await anthropicClient.messages.create(
+            model="claude-opus-5",
+            max_tokens=1024,
+            messages=messages,
+            tools=anthropic_time_tools,
+            tool_choice={"type": "none"},
+        )
+        return next((b.text for b in final.content if b.type == "text"), "")
     except Exception as e:  # noqa: BLE001 - Anthropic errors and tool-call handling both surface as 500
         raise HTTPException(status_code=500, detail=str(e))
 
