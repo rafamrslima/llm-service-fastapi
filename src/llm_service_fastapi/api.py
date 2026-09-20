@@ -425,10 +425,22 @@ async def list_tools():
     
     return {
         "tools": [
-            {"name": t.name, "description": t.description, "schema": t.inputSchema}
+            {"name": t.name, "description": t.description, "schema": t.input_schema}
             for t in response.tools
         ]
     }
+
+
+def mcp_text_or_raise(result, tool_name: str) -> list[str]:
+    # MCP tools report failures as is_error results rather than raising.
+    text_blocks = [c.text for c in result.content if c.type == "text"]
+    if result.is_error:
+        raise HTTPException(
+            status_code=400,
+            detail=" ".join(text_blocks) or f"{tool_name} failed.",
+        )
+    return text_blocks
+
 
 @app.post("/files/write")
 async def write_file(payload: WriteFileRequest):
@@ -441,7 +453,7 @@ async def write_file(payload: WriteFileRequest):
             name="write_file",
             arguments={"path": full_path, "content": payload.content}
         )
-        text_blocks = [c.text for c in result.content if c.type == "text"]
+        text_blocks = mcp_text_or_raise(result, "write_file")
         return {"status": "success", "mcp_response": text_blocks}
     except HTTPException:
         raise
@@ -460,7 +472,7 @@ async def read_file(payload: ReadFileRequest):
             name="read_file",
             arguments={"path": full_path}
         )
-        text_blocks = [c.text for c in result.content if c.type == "text"]
+        text_blocks = mcp_text_or_raise(result, "read_file")
         if not text_blocks:
             raise HTTPException(
                 status_code=500,
