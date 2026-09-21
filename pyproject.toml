@@ -11,6 +11,7 @@ dependencies = [
     "anthropic>=1.5.0",
     "datetime>=6.0",
     "fastapi[standard]>=0.141.1",
+    "fastmcp>=4.0.5",
     "google-genai>=2.20.0",
     "httpx>=0.28.1",
     "mcp>=2.2.0",

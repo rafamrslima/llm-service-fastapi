@@ -81,6 +81,8 @@ uv run pytest
 | POST   | `/analyze/ollama`     | The real feature, via a local Ollama model — see below.                  |
 | POST   | `/ask/gemini`         | Free-form question answered by Gemini with time tools — see below.       |
 | POST   | `/ask/anthropic`      | Free-form question answered by Claude with time tools — see below.       |
+| GET    | `/time-mcp/tools`     | Lists the tools of the time MCP server — see [Time MCP server](#time-mcp-server). |
+| POST   | `/time-mcp/call`      | Calls a tool on the time MCP server — see [Time MCP server](#time-mcp-server).     |
 
 ### `POST /analyze/gemini`, `POST /analyze/anthropic`, and `POST /analyze/ollama`
 
@@ -161,7 +163,35 @@ are `America/Sao_Paulo`, `Europe/London`, and `Asia/Tokyo`.
   offsets in effect today. The result can land on a different calendar day. For example,
   15:00 in São Paulo is 03:00 the next day in Tokyo.
 - **`is_business_hours`** uses fixed hours (`BUSINESS_HOURS_START` / `BUSINESS_HOURS_END` in
-  `api.py`). It doesn't know about public holidays.
+  `time_tools.py`). It doesn't know about public holidays.
+
+The tool functions live in `time_tools.py`, and both the Gemini/Claude loops and the MCP
+server below use them.
+
+### Time MCP server
+
+The same three tools are also exposed as an MCP server, built with
+[FastMCP](https://gofastmcp.com) in `time_mcp_server.py`. The API starts it as a child
+process over stdio when it boots, next to the filesystem MCP server, and stops it on
+shutdown. Nothing needs to be started by hand.
+
+| Method | Path               | Description                                                       |
+|--------|--------------------|-------------------------------------------------------------------|
+| GET    | `/time-mcp/tools`  | Lists the server's tools with their descriptions and schemas.      |
+| POST   | `/time-mcp/call`   | Calls a tool by name, e.g. `{"name": "convert_time", "arguments": {"time": "15:00", "from_tz": "America/Sao_Paulo", "to_tz": "Asia/Tokyo"}}`. |
+
+Response (`200`): `{"status": "success", "result": ["2026-09-22T03:00:00+09:00"]}`. An
+unknown tool name or invalid arguments (for example `"time": "3pm"`) returns a `400` with
+the server's error message.
+
+You can also run the server on its own and point any stdio MCP client at it:
+
+```bash
+uv run python -m llm_service_fastapi.time_mcp_server
+```
+
+Stdout is the protocol channel for stdio servers, so code in `time_tools.py` and
+`time_mcp_server.py` must not `print()`. Log to stderr instead.
 
 ## Design choices
 

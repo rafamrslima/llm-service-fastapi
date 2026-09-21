@@ -1,20 +1,29 @@
 import json
 import logging
+import os
+import sys
+from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import datetime
 from enum import Enum
-from zoneinfo import ZoneInfo
-import os
+
 import ollama
 from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from google import genai
 from google.genai import types
-from pydantic import BaseModel, Field, ValidationError
-from contextlib import AsyncExitStack
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from contextlib import asynccontextmanager
+from pydantic import BaseModel, Field, ValidationError
+
+from llm_service_fastapi.time_tools import (
+    TOOL_DESCRIPTIONS,
+    TimeOfDay,
+    Timezones,
+    convert_time,
+    get_current_time,
+    is_business_hours,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -51,12 +60,6 @@ class ChatResponse(BaseModel):
     answer: str
 
 
-class Timezones(str, Enum):
-    SAO_PAULO = "America/Sao_Paulo"
-    LONDON = "Europe/London"
-    TOKYO = "Asia/Tokyo"
-
-
 class WriteFileRequest(BaseModel):
     rel_path: str
     content: str
@@ -66,8 +69,11 @@ class ReadFileRequest(BaseModel):
     rel_path: str
 
 
-BUSINESS_HOURS_START = 9
-BUSINESS_HOURS_END = 17
+class TimeMcpCallRequest(BaseModel):
+    name: str
+    arguments: dict = Field(default_factory=dict)
+
+
 SANDBOX_PATH = os.path.expanduser("~/mcp_sandbox")
 
 
@@ -83,27 +89,6 @@ def resolve_sandboxed_path(rel_path: str) -> str:
     return full_path
 
 
-def get_current_time(tz: Timezones):
-    time_now = datetime.now(ZoneInfo(tz.value))
-    print(time_now)
-    return time_now
-
-
-def convert_time(time: str, from_tz: Timezones, to_tz: Timezones):
-    source_zone = ZoneInfo(from_tz.value)
-    # Anchored to today's date in the source zone so the conversion respects DST.
-    today = datetime.now(source_zone).date()
-    parsed = datetime.strptime(time, "%H:%M").time()  # noqa: DTZ007 - only the time part is kept; tzinfo is attached below
-    source = datetime.combine(today, parsed, tzinfo=source_zone)
-    return source.astimezone(ZoneInfo(to_tz.value))
-
-
-def is_business_hours(tz: Timezones):
-    now = datetime.now(ZoneInfo(tz.value))
-    is_weekday = now.weekday() < 5
-    return is_weekday and BUSINESS_HOURS_START <= now.hour < BUSINESS_HOURS_END
-
-
 class GetCurrentTimeParams(BaseModel):
     tz: Timezones = Field(
         description="IANA timezone name to compute the current local time for."
@@ -111,10 +96,7 @@ class GetCurrentTimeParams(BaseModel):
 
 
 class ConvertTimeParams(BaseModel):
-    time: str = Field(
-        description="Time to convert, in 24-hour HH:MM format.",
-        pattern=r"^([01]\d|2[0-3]):[0-5]\d$",
-    )
+    time: TimeOfDay
     from_tz: Timezones = Field(description="IANA timezone the time is given in.")
     to_tz: Timezones = Field(description="IANA timezone to convert the time into.")
 
@@ -125,24 +107,17 @@ class IsBusinessHoursParams(BaseModel):
 
 TOOL_SPECS = {
     "get_current_time": (
-        "Returns the current local date and time for a given IANA timezone.",
+        TOOL_DESCRIPTIONS["get_current_time"],
         GetCurrentTimeParams,
         get_current_time,
     ),
     "convert_time": (
-        (
-            "Converts a time from one IANA timezone to another, using today's "
-            "date in the source timezone."
-        ),
+        TOOL_DESCRIPTIONS["convert_time"],
         ConvertTimeParams,
         convert_time,
     ),
     "is_business_hours": (
-        (
-            f"Returns whether it is currently business hours "
-            f"({BUSINESS_HOURS_START:02d}:00-{BUSINESS_HOURS_END:02d}:00, "
-            f"Monday to Friday) in a given IANA timezone."
-        ),
+        TOOL_DESCRIPTIONS["is_business_hours"],
         IsBusinessHoursParams,
         is_business_hours,
     ),
@@ -197,30 +172,44 @@ def run_tool(name: str, args: dict | None) -> tuple[object, bool]:
     return (result.isoformat() if isinstance(result, datetime) else result), False
 
 
+async def start_mcp_session(
+    stack: AsyncExitStack, params: StdioServerParameters
+) -> ClientSession:
+    """Spawns an MCP server as a child process; the stack tears it down on exit."""
+    read_stream, write_stream = await stack.enter_async_context(stdio_client(params))
+    session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
+    await session.initialize()
+    return session
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifecycle manager: Spawns MCP subprocess on API startup, cleans up on shutdown."""
+    """Lifecycle manager: Spawns MCP subprocesses on API startup, cleans up on shutdown."""
     os.makedirs(SANDBOX_PATH, exist_ok=True)
 
-    # Configure stdio process launch parameters
-    server_params = StdioServerParameters(
-        command="npx",
-        args=["-y", "@modelcontextprotocol/server-filesystem", SANDBOX_PATH],
-    )
+    async with AsyncExitStack() as stack:
+        print(f"[MCP] Spawning Filesystem MCP server targeting: {SANDBOX_PATH}")
+        app.state.mcp_session = await start_mcp_session(
+            stack,
+            StdioServerParameters(
+                command="npx",
+                args=["-y", "@modelcontextprotocol/server-filesystem", SANDBOX_PATH],
+            ),
+        )
 
-    print(f"[MCP] Spawning Filesystem MCP server targeting: {SANDBOX_PATH}")
+        print("[MCP] Spawning Time MCP server")
+        app.state.time_mcp_session = await start_mcp_session(
+            stack,
+            StdioServerParameters(
+                command=sys.executable,
+                args=["-m", "llm_service_fastapi.time_mcp_server"],
+            ),
+        )
 
-    # Launch subprocess streams and client session
-    async with stdio_client(server_params) as (read_stream, write_stream):
-        async with ClientSession(read_stream, write_stream) as session:
-            await session.initialize()
-            print("[MCP] Server initialized successfully.")
+        print("[MCP] Servers initialized successfully.")
+        yield
 
-            # Store session globally on app state for endpoints to use
-            app.state.mcp_session = session
-            yield
-
-    print("[MCP] Process shut down safely.")
+    print("[MCP] Processes shut down safely.")
 
 
 load_dotenv()
@@ -479,6 +468,35 @@ async def read_file(payload: ReadFileRequest):
                 detail="read_file returned no text content.",
             )
         return {"status": "success", "content": text_blocks[0]}
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001 - MCP call failures surface as 500
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/time-mcp/tools")
+async def list_time_mcp_tools():
+    """Returns all tools exported by the time MCP server."""
+    session: ClientSession = app.state.time_mcp_session
+    response = await session.list_tools()
+
+    return {
+        "tools": [
+            {"name": t.name, "description": t.description, "schema": t.input_schema}
+            for t in response.tools
+        ]
+    }
+
+
+@app.post("/time-mcp/call")
+async def call_time_mcp_tool(payload: TimeMcpCallRequest):
+    """Calls a tool on the time MCP server by name."""
+    session: ClientSession = app.state.time_mcp_session
+
+    try:
+        result = await session.call_tool(name=payload.name, arguments=payload.arguments)
+        text_blocks = mcp_text_or_raise(result, payload.name)
+        return {"status": "success", "result": text_blocks}
     except HTTPException:
         raise
     except Exception as e:  # noqa: BLE001 - MCP call failures surface as 500
